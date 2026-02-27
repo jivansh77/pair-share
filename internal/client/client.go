@@ -200,10 +200,15 @@ func RunGuest(opts GuestOptions) error {
 	go func() {
 		<-sigCh
 		term.Restore(fd, oldState)
+		infoStyle.Fprintln(os.Stderr, "\n[pair-share] Disconnected.")
 		os.Exit(0)
 	}()
 
+	// Show connection hint
+	infoStyle.Fprintln(os.Stderr, "[pair-share] Connected. Press Enter, then ~. to disconnect (~? for help)")
+
 	done := make(chan struct{})
+	disconnect := make(chan struct{})
 
 	// WebSocket → stdout (see host's terminal)
 	go func() {
@@ -230,8 +235,12 @@ func RunGuest(opts GuestOptions) error {
 	}()
 
 	// stdin → WebSocket (send keystrokes to host)
+	// Supports SSH-style escape sequence: ~. to disconnect
 	go func() {
 		buf := make([]byte, 256)
+		afterNewline := true // Start as if after newline
+		escapePending := false
+
 		for {
 			n, err := os.Stdin.Read(buf)
 			if err != nil {
@@ -240,15 +249,67 @@ func RunGuest(opts GuestOptions) error {
 				}
 				return
 			}
-			frame := relay.MakeDataFrame(buf[:n])
-			if err := conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
-				return
+
+			// Process each byte for escape sequence detection
+			toSend := make([]byte, 0, n)
+			for i := 0; i < n; i++ {
+				b := buf[i]
+
+				if escapePending {
+					escapePending = false
+					switch b {
+					case '.':
+						// ~. = disconnect
+						term.Restore(fd, oldState)
+						infoStyle.Fprintln(os.Stderr, "\n[pair-share] Disconnected.")
+						close(disconnect)
+						return
+					case '~':
+						// ~~ = send single ~
+						toSend = append(toSend, '~')
+					case '?':
+						// ~? = show help (don't send)
+						showEscapeHelp(fd, oldState)
+					default:
+						// Not a recognized escape, send ~ and the char
+						toSend = append(toSend, '~', b)
+					}
+					afterNewline = (b == '\r' || b == '\n')
+					continue
+				}
+
+				if afterNewline && b == '~' {
+					// Start of potential escape sequence
+					escapePending = true
+					continue
+				}
+
+				afterNewline = (b == '\r' || b == '\n')
+				toSend = append(toSend, b)
+			}
+
+			if len(toSend) > 0 {
+				frame := relay.MakeDataFrame(toSend)
+				if err := conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+					return
+				}
 			}
 		}
 	}()
 
-	<-done
+	select {
+	case <-done:
+	case <-disconnect:
+	}
 	return nil
+}
+
+func showEscapeHelp(fd int, oldState *term.State) {
+	help := "\r\n[pair-share] Escape sequences:\r\n" +
+		"  ~.  - Disconnect from session\r\n" +
+		"  ~~  - Send literal ~\r\n" +
+		"  ~?  - Show this help\r\n"
+	os.Stderr.WriteString(help)
 }
 
 func handleHostControlMsg(jsonData []byte, fd int, oldState *term.State) {

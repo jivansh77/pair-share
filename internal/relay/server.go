@@ -158,6 +158,8 @@ func (s *Server) handleHost(conn *websocket.Conn, sessionID string, r *http.Requ
 
 		switch data[0] {
 		case MsgTypePTY:
+			// Store in scrollback buffer (raw PTY data without frame prefix)
+			sess.AppendScrollback(data[1:])
 			sess.BroadcastToGuests(data)
 		case MsgTypeControl:
 			s.handleHostControl(sess, data[1:])
@@ -193,11 +195,18 @@ func (s *Server) handleGuest(conn *websocket.Conn, sessionID string, r *http.Req
 
 	log.Printf("Guest joined: session=%s guests=%d control=%v", sessionID, guestCount, canControl)
 
+	// Send current terminal size
 	sendControlMsg(conn, ControlMessage{
 		Type: "resize",
 		Cols: sess.TermSize.Cols,
 		Rows: sess.TermSize.Rows,
 	})
+
+	// Send scrollback buffer so guest sees current screen state
+	if scrollback := sess.GetScrollback(); len(scrollback) > 0 {
+		frame := MakeDataFrame(scrollback)
+		_ = conn.WriteMessage(websocket.BinaryMessage, frame)
+	}
 
 	roleStr := "watch"
 	if canControl {

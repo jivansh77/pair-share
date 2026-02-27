@@ -20,6 +20,8 @@ type GuestConn struct {
 	HasCtrl bool
 }
 
+const ScrollbackSize = 64 * 1024 // 64KB ring buffer
+
 type Session struct {
 	ID        string
 	Host      *websocket.Conn
@@ -30,7 +32,8 @@ type Session struct {
 	Password  string // bcrypt hash, empty if unset
 	WatchOnly bool   // default mode for guests
 
-	mu sync.RWMutex
+	scrollback []byte
+	mu         sync.RWMutex
 }
 
 func NewSession(id string, ttl time.Duration, watchOnly bool, password string) *Session {
@@ -72,6 +75,32 @@ func (s *Session) BroadcastToGuests(data []byte) {
 	for _, g := range s.Guests {
 		_ = g.Conn.WriteMessage(websocket.BinaryMessage, data)
 	}
+}
+
+// AppendScrollback adds PTY data to the ring buffer.
+// Only stores the raw PTY bytes (without the 0x00 frame prefix).
+func (s *Session) AppendScrollback(data []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.scrollback = append(s.scrollback, data...)
+	if len(s.scrollback) > ScrollbackSize {
+		// Trim to keep only the last ScrollbackSize bytes
+		s.scrollback = s.scrollback[len(s.scrollback)-ScrollbackSize:]
+	}
+}
+
+// GetScrollback returns a copy of the current scrollback buffer.
+func (s *Session) GetScrollback() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.scrollback) == 0 {
+		return nil
+	}
+	result := make([]byte, len(s.scrollback))
+	copy(result, s.scrollback)
+	return result
 }
 
 func GenerateID() (string, error) {
