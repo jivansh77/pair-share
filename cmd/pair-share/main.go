@@ -248,33 +248,78 @@ func rollbackCmd() *cobra.Command {
 func replayCmd() *cobra.Command {
 	var server string
 	var speed float64
+	var fromFile string
+	var exportTo string
 
 	cmd := &cobra.Command{
-		Use:   "replay <session-id>",
+		Use:   "replay [session-id]",
 		Short: "Replay the activity log of a session",
-		Args:  cobra.ExactArgs(1),
+		Long: `Replay the activity log of a session.
+
+You can either replay from a live relay server or from a saved log file.
+
+Examples:
+  # Replay from relay server
+  pair-share replay swift-koala-42 --server ws://localhost:8080
+
+  # Export log to file for later replay
+  pair-share replay swift-koala-42 --server ws://localhost:8080 --export session.json
+
+  # Replay from saved file (works offline, after session expires)
+  pair-share replay --from-file session.json --speed 2`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			sessionID := args[0]
-			httpURL := wsToHTTP(server)
-
-			resp, err := http.Get(fmt.Sprintf("%s/session/%s/log", httpURL, sessionID))
-			if err != nil {
-				return fmt.Errorf("failed to contact relay: %w", err)
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != 200 {
-				body, _ := io.ReadAll(resp.Body)
-				return fmt.Errorf("relay error: %s", strings.TrimSpace(string(body)))
-			}
-
 			var entries []actlog.LogEntry
-			if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
-				return fmt.Errorf("failed to decode log: %w", err)
+
+			if fromFile != "" {
+				// Load from local file
+				data, err := os.ReadFile(fromFile)
+				if err != nil {
+					return fmt.Errorf("failed to read log file: %w", err)
+				}
+				if err := json.Unmarshal(data, &entries); err != nil {
+					return fmt.Errorf("failed to parse log file: %w", err)
+				}
+				infoStyle.Printf("Loaded %d entries from %s\n", len(entries), fromFile)
+			} else {
+				// Fetch from relay server
+				if len(args) == 0 {
+					return fmt.Errorf("session-id is required when not using --from-file")
+				}
+				sessionID := args[0]
+				httpURL := wsToHTTP(server)
+
+				resp, err := http.Get(fmt.Sprintf("%s/session/%s/log", httpURL, sessionID))
+				if err != nil {
+					return fmt.Errorf("failed to contact relay: %w", err)
+				}
+				defer resp.Body.Close()
+
+				if resp.StatusCode != 200 {
+					body, _ := io.ReadAll(resp.Body)
+					return fmt.Errorf("relay error: %s", strings.TrimSpace(string(body)))
+				}
+
+				if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
+					return fmt.Errorf("failed to decode log: %w", err)
+				}
 			}
 
 			if len(entries) == 0 {
 				fmt.Println("No activity log entries found.")
+				return nil
+			}
+
+			// Export to file if requested
+			if exportTo != "" {
+				data, err := json.MarshalIndent(entries, "", "  ")
+				if err != nil {
+					return fmt.Errorf("failed to serialize log: %w", err)
+				}
+				if err := os.WriteFile(exportTo, data, 0644); err != nil {
+					return fmt.Errorf("failed to write log file: %w", err)
+				}
+				successStyle.Printf("✓ Exported %d entries to %s\n", len(entries), exportTo)
 				return nil
 			}
 
@@ -325,6 +370,8 @@ func replayCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&server, "server", defaultServer, "Relay server URL")
 	cmd.Flags().Float64Var(&speed, "speed", 1.0, "Playback speed multiplier (e.g., 2.0 for 2x)")
+	cmd.Flags().StringVar(&fromFile, "from-file", "", "Replay from a saved log file instead of relay")
+	cmd.Flags().StringVar(&exportTo, "export", "", "Export the log to a file instead of replaying")
 
 	return cmd
 }

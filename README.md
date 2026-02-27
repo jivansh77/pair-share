@@ -113,12 +113,26 @@ Displays the saved scrollback and prompts to restore the git stash.
 | `--session` | *required* | Session ID |
 | `--no-git` | `false` | Skip git stash restore |
 
-### `pair-share replay <session-id>`
+### `pair-share replay [session-id]`
 
-Replay the activity log of a session.
+Replay the activity log of a session. You can replay from a live relay server or from a saved log file.
+
+**Replay from relay:**
 
 ```bash
 pair-share replay swift-koala-42 --server ws://localhost:8080 --speed 2
+```
+
+**Export log for offline replay:**
+
+```bash
+pair-share replay swift-koala-42 --server ws://localhost:8080 --export demo-session.json
+```
+
+**Replay from saved file (works offline, after session expires):**
+
+```bash
+pair-share replay --from-file demo-session.json --speed 1.5
 ```
 
 Plays back the session at real-time speed (or faster with `--speed`). Host output is shown in default color, guest input in white, and agent input in yellow.
@@ -127,6 +141,8 @@ Plays back the session at real-time speed (or faster with `--speed`). Host outpu
 |------|---------|-------------|
 | `--server` | `ws://localhost:8080` | Relay server URL |
 | `--speed` | `1.0` | Playback speed multiplier |
+| `--from-file` | | Replay from a saved log file instead of relay |
+| `--export` | | Export the log to a file instead of replaying |
 
 ### `pair-share summon <agent>`
 
