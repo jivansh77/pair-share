@@ -1,10 +1,12 @@
 package relay
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,13 +20,18 @@ const (
 )
 
 type ControlMessage struct {
-	Type      string `json:"type"`
-	Cols      uint16 `json:"cols,omitempty"`
-	Rows      uint16 `json:"rows,omitempty"`
-	Role      string `json:"role,omitempty"`
-	SessionID string `json:"session_id,omitempty"`
-	Guests    int    `json:"guests,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Type          string `json:"type"`
+	Cols          uint16 `json:"cols,omitempty"`
+	Rows          uint16 `json:"rows,omitempty"`
+	Role          string `json:"role,omitempty"`
+	SessionID     string `json:"session_id,omitempty"`
+	Guests        int    `json:"guests,omitempty"`
+	Error         string `json:"error,omitempty"`
+	Label         string `json:"label,omitempty"`
+	ScrollbackB64 string `json:"scrollback_b64,omitempty"`
+	Access        string `json:"access,omitempty"`
+	TTL           string `json:"ttl,omitempty"`
+	Token         string `json:"token,omitempty"`
 }
 
 type Server struct {
@@ -47,7 +54,7 @@ func NewServer() *Server {
 func (s *Server) Start(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/session/", s.handleSessionInfo)
+	mux.HandleFunc("/session/", s.handleSessionRoute)
 	mux.HandleFunc("/ws", s.handleWebSocket)
 
 	go s.cleanupLoop()
@@ -56,14 +63,34 @@ func (s *Server) Start(addr string) error {
 	return http.ListenAndServe(addr, mux)
 }
 
+func (s *Server) handleSessionRoute(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path[len("/session/"):]
+
+	if strings.HasSuffix(path, "/log") {
+		id := strings.TrimSuffix(path, "/log")
+		s.handleSessionLog(w, r, id)
+		return
+	}
+	if strings.HasSuffix(path, "/checkpoint") {
+		id := strings.TrimSuffix(path, "/checkpoint")
+		s.handleCheckpointAPI(w, r, id)
+		return
+	}
+	if strings.HasSuffix(path, "/summon") {
+		id := strings.TrimSuffix(path, "/summon")
+		s.handleSummonAPI(w, r, id)
+		return
+	}
+	s.handleSessionInfo(w, r, path)
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }
 
-func (s *Server) handleSessionInfo(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Path[len("/session/"):]
+func (s *Server) handleSessionInfo(w http.ResponseWriter, r *http.Request, id string) {
 	if id == "" {
 		http.Error(w, "missing session id", http.StatusBadRequest)
 		return
@@ -86,6 +113,30 @@ func (s *Server) handleSessionInfo(w http.ResponseWriter, r *http.Request) {
 		"watch_only": sess.WatchOnly,
 	}
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Server) handleSessionLog(w http.ResponseWriter, r *http.Request, id string) {
+	if id == "" {
+		http.Error(w, "missing session id", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.RLock()
+	sess, ok := s.sessions[id]
+	s.mu.RUnlock()
+
+	if !ok {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	data, err := sess.Log.MarshalJSON()
+	if err != nil {
+		http.Error(w, "failed to serialize log", http.StatusInternalServerError)
+		return
+	}
+	w.Write(data)
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -158,10 +209,11 @@ func (s *Server) handleHost(conn *websocket.Conn, sessionID string, r *http.Requ
 
 		switch data[0] {
 		case MsgTypePTY:
-			// Store in scrollback buffer (raw PTY data without frame prefix)
 			sess.AppendScrollback(data[1:])
+			sess.Log.Append("host", data[1:], false)
 			sess.BroadcastToGuests(data)
 		case MsgTypeControl:
+			sess.Log.Append("host", data[1:], true)
 			s.handleHostControl(sess, data[1:])
 		}
 	}
@@ -178,7 +230,25 @@ func (s *Server) handleGuest(conn *websocket.Conn, sessionID string, r *http.Req
 		return
 	}
 
-	if sess.Password != "" {
+	// Check token-based auth (agent) or password
+	token := r.URL.Query().Get("token")
+	isAgent := r.URL.Query().Get("role") == "agent"
+	agentToken := ""
+
+	if token != "" {
+		at, valid := sess.ValidateToken(token)
+		if !valid {
+			sendControlMsg(conn, ControlMessage{Type: "error", Error: "invalid or expired token"})
+			conn.Close()
+			return
+		}
+		isAgent = true
+		agentToken = token
+		// Token determines access level
+		if at.Role == "watch" {
+			r.URL.Query().Set("watch", "true")
+		}
+	} else if sess.Password != "" {
 		pw := r.URL.Query().Get("password")
 		if pw != sess.Password {
 			sendControlMsg(conn, ControlMessage{Type: "error", Error: "invalid password"})
@@ -188,21 +258,33 @@ func (s *Server) handleGuest(conn *websocket.Conn, sessionID string, r *http.Req
 	}
 
 	watchMode := r.URL.Query().Get("watch") == "true" || sess.WatchOnly
+	if token != "" {
+		if at, valid := sess.ValidateToken(token); valid && at.Role == "watch" {
+			watchMode = true
+		}
+	}
 	canControl := !watchMode
 
-	sess.AddGuest(conn, canControl)
+	sess.AddGuest(conn, canControl, isAgent)
+	if isAgent && agentToken != "" {
+		sess.SetGuestToken(conn, agentToken)
+	}
 	guestCount := sess.GuestCount()
 
-	log.Printf("Guest joined: session=%s guests=%d control=%v", sessionID, guestCount, canControl)
+	source := "guest"
+	if isAgent {
+		source = "agent"
+		log.Printf("Agent joined: session=%s guests=%d control=%v token=%s", sessionID, guestCount, canControl, agentToken)
+	} else {
+		log.Printf("Guest joined: session=%s guests=%d control=%v", sessionID, guestCount, canControl)
+	}
 
-	// Send current terminal size
 	sendControlMsg(conn, ControlMessage{
 		Type: "resize",
 		Cols: sess.TermSize.Cols,
 		Rows: sess.TermSize.Rows,
 	})
 
-	// Send scrollback buffer so guest sees current screen state
 	if scrollback := sess.GetScrollback(); len(scrollback) > 0 {
 		frame := MakeDataFrame(scrollback)
 		_ = conn.WriteMessage(websocket.BinaryMessage, frame)
@@ -214,13 +296,16 @@ func (s *Server) handleGuest(conn *websocket.Conn, sessionID string, r *http.Req
 	}
 	sendControlMsg(conn, ControlMessage{Type: "role", Role: roleStr})
 
-	// Notify host about guest join
 	if sess.Host != nil {
-		sendControlMsg(sess.Host, ControlMessage{
+		infoMsg := ControlMessage{
 			Type:   "info",
 			Guests: guestCount,
 			Role:   roleStr,
-		})
+		}
+		if isAgent {
+			infoMsg.Role = "agent/" + roleStr
+		}
+		sendControlMsg(sess.Host, infoMsg)
 	}
 
 	defer func() {
@@ -233,7 +318,7 @@ func (s *Server) handleGuest(conn *websocket.Conn, sessionID string, r *http.Req
 				Guests: remaining,
 			})
 		}
-		log.Printf("Guest left: session=%s guests=%d", sessionID, remaining)
+		log.Printf("%s left: session=%s guests=%d", source, sessionID, remaining)
 	}()
 
 	for {
@@ -247,11 +332,12 @@ func (s *Server) handleGuest(conn *websocket.Conn, sessionID string, r *http.Req
 
 		switch data[0] {
 		case MsgTypePTY:
+			sess.Log.Append(source, data[1:], false)
 			if canControl && sess.Host != nil {
 				_ = sess.Host.WriteMessage(websocket.BinaryMessage, data)
 			}
 		case MsgTypeControl:
-			// Guests can only send resize for now
+			sess.Log.Append(source, data[1:], true)
 		}
 	}
 }
@@ -267,6 +353,46 @@ func (s *Server) handleHostControl(sess *session.Session, jsonData []byte) {
 		sess.TermSize = session.TermSize{Cols: msg.Cols, Rows: msg.Rows}
 		frame := makeControlFrame(msg)
 		sess.BroadcastToGuests(frame)
+
+	case "checkpoint":
+		scrollback := sess.GetScrollback()
+		b64 := base64.StdEncoding.EncodeToString(scrollback)
+		sendControlMsg(sess.Host, ControlMessage{
+			Type:          "checkpoint_ack",
+			Label:         msg.Label,
+			ScrollbackB64: b64,
+		})
+
+	case "summon":
+		ttl := 120 * time.Second
+		if msg.TTL != "" {
+			if parsed, err := time.ParseDuration(msg.TTL); err == nil {
+				ttl = parsed
+			}
+		}
+		access := msg.Access
+		if access == "" {
+			access = "watch"
+		}
+
+		token, err := sess.AddToken(access, ttl)
+		if err != nil {
+			sendControlMsg(sess.Host, ControlMessage{Type: "error", Error: "failed to generate token"})
+			return
+		}
+
+		sendControlMsg(sess.Host, ControlMessage{
+			Type:  "summon_ack",
+			Token: token,
+		})
+
+		// Auto-expire: close agent connection after TTL
+		go func(token string, ttl time.Duration) {
+			time.Sleep(ttl)
+			sess.CloseAgentByToken(token)
+			sess.RemoveToken(token)
+			log.Printf("Agent token expired: session=%s token=%s", sess.ID, token)
+		}(token, ttl)
 	}
 }
 
@@ -291,6 +417,80 @@ func (s *Server) cleanupLoop() {
 		}
 		s.mu.Unlock()
 	}
+}
+
+func (s *Server) handleCheckpointAPI(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.mu.RLock()
+	sess, ok := s.sessions[id]
+	s.mu.RUnlock()
+
+	if !ok {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+
+	scrollback := sess.GetScrollback()
+	b64 := base64.StdEncoding.EncodeToString(scrollback)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"scrollback_b64": b64,
+		"scrollback_len": len(scrollback),
+	})
+}
+
+func (s *Server) handleSummonAPI(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.mu.RLock()
+	sess, ok := s.sessions[id]
+	s.mu.RUnlock()
+
+	if !ok {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+
+	access := r.URL.Query().Get("access")
+	if access == "" {
+		access = "watch"
+	}
+	ttlStr := r.URL.Query().Get("ttl")
+	ttl := 120 * time.Second
+	if ttlStr != "" {
+		if parsed, err := time.ParseDuration(ttlStr); err == nil {
+			ttl = parsed
+		}
+	}
+
+	token, err := sess.AddToken(access, ttl)
+	if err != nil {
+		http.Error(w, "failed to generate token", http.StatusInternalServerError)
+		return
+	}
+
+	// Auto-expire
+	go func(token string, ttl time.Duration) {
+		time.Sleep(ttl)
+		sess.CloseAgentByToken(token)
+		sess.RemoveToken(token)
+		log.Printf("Agent token expired: session=%s token=%s", sess.ID, token)
+	}(token, ttl)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"token":  token,
+		"access": access,
+		"ttl":    ttl.String(),
+	})
 }
 
 func sendControlMsg(conn *websocket.Conn, msg ControlMessage) {

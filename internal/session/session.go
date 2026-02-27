@@ -2,12 +2,14 @@ package session
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	actlog "github.com/jivansh77/pair-share/internal/log"
 )
 
 type TermSize struct {
@@ -18,6 +20,14 @@ type TermSize struct {
 type GuestConn struct {
 	Conn    *websocket.Conn
 	HasCtrl bool
+	IsAgent bool
+	Token   string // agent token, empty for human guests
+}
+
+type AgentToken struct {
+	Token     string
+	Role      string // "watch" or "control"
+	ExpiresAt time.Time
 }
 
 const ScrollbackSize = 64 * 1024 // 64KB ring buffer
@@ -31,6 +41,8 @@ type Session struct {
 	TTL       time.Duration
 	Password  string // bcrypt hash, empty if unset
 	WatchOnly bool   // default mode for guests
+	Log       *actlog.ActivityLog
+	Tokens    map[string]*AgentToken
 
 	scrollback []byte
 	mu         sync.RWMutex
@@ -44,6 +56,8 @@ func NewSession(id string, ttl time.Duration, watchOnly bool, password string) *
 		TTL:       ttl,
 		WatchOnly: watchOnly,
 		Password:  password,
+		Log:       actlog.NewActivityLog(),
+		Tokens:    make(map[string]*AgentToken),
 	}
 }
 
@@ -51,10 +65,27 @@ func (s *Session) IsExpired() bool {
 	return time.Since(s.CreatedAt) > s.TTL
 }
 
-func (s *Session) AddGuest(conn *websocket.Conn, canControl bool) {
+func (s *Session) AddGuest(conn *websocket.Conn, canControl bool, isAgent bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.Guests[conn] = &GuestConn{Conn: conn, HasCtrl: canControl}
+	s.Guests[conn] = &GuestConn{Conn: conn, HasCtrl: canControl, IsAgent: isAgent}
+}
+
+func (s *Session) SetGuestToken(conn *websocket.Conn, token string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if g, ok := s.Guests[conn]; ok {
+		g.Token = token
+	}
+}
+
+func (s *Session) IsAgentConn(conn *websocket.Conn) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if g, ok := s.Guests[conn]; ok {
+		return g.IsAgent
+	}
+	return false
 }
 
 func (s *Session) RemoveGuest(conn *websocket.Conn) {
@@ -133,4 +164,51 @@ func randRange(min, max int) (int, error) {
 		return 0, err
 	}
 	return int(n.Int64()) + min, nil
+}
+
+func (s *Session) AddToken(role string, ttl time.Duration) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	token := "tok_" + hex.EncodeToString(b)
+
+	s.Tokens[token] = &AgentToken{
+		Token:     token,
+		Role:      role,
+		ExpiresAt: time.Now().Add(ttl),
+	}
+	return token, nil
+}
+
+func (s *Session) ValidateToken(token string) (*AgentToken, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	t, ok := s.Tokens[token]
+	if !ok || time.Now().After(t.ExpiresAt) {
+		return nil, false
+	}
+	return t, true
+}
+
+func (s *Session) RemoveToken(token string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.Tokens, token)
+}
+
+// CloseAgentByToken closes the agent connection that used the given token.
+func (s *Session) CloseAgentByToken(token string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, g := range s.Guests {
+		if g.IsAgent && g.Token == token {
+			g.Conn.Close()
+			return
+		}
+	}
 }

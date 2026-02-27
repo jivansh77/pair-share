@@ -38,6 +38,8 @@ type GuestOptions struct {
 	SessionID string
 	Watch     bool
 	Password  string
+	Token     string
+	Role      string
 }
 
 // RunHost starts a shared terminal session as the host.
@@ -170,6 +172,10 @@ func RunGuest(opts GuestOptions) error {
 		"session":  opts.SessionID,
 		"role":     "guest",
 		"password": opts.Password,
+		"token":    opts.Token,
+	}
+	if opts.Role != "" {
+		params["role"] = opts.Role
 	}
 	if opts.Watch {
 		params["watch"] = "true"
