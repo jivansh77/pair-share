@@ -127,7 +127,7 @@ func isGitRepo() bool {
 
 func gitStash(label string) (string, error) {
 	msg := fmt.Sprintf("pair-share: %s", label)
-	cmd := exec.Command("git", "stash", "push", "-m", msg)
+	cmd := exec.Command("git", "stash", "push", "-u", "-m", msg)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", err
