@@ -86,14 +86,27 @@ func Load(sessionID, label string) (*Checkpoint, error) {
 	return nil, fmt.Errorf("checkpoint %q not found for session %s", label, sessionID)
 }
 
-// Rollback restores a checkpoint: prints scrollback and pops git stash.
+// Rollback restores a checkpoint: discards current changes and restores saved state.
 func Rollback(chk *Checkpoint, confirm bool) error {
 	if chk.GitStash != "" && confirm {
-		cmd := exec.Command("git", "stash", "pop")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("git stash pop failed: %w", err)
+		// Step 1: Discard all current changes (tracked files)
+		checkoutCmd := exec.Command("git", "checkout", ".")
+		checkoutCmd.Stdout = os.Stdout
+		checkoutCmd.Stderr = os.Stderr
+		_ = checkoutCmd.Run()
+
+		// Step 2: Remove untracked files
+		cleanCmd := exec.Command("git", "clean", "-fd")
+		cleanCmd.Stdout = os.Stdout
+		cleanCmd.Stderr = os.Stderr
+		_ = cleanCmd.Run()
+
+		// Step 3: Apply the stashed state (use apply, not pop, to keep stash for re-rollback)
+		applyCmd := exec.Command("git", "stash", "apply", chk.GitStash)
+		applyCmd.Stdout = os.Stdout
+		applyCmd.Stderr = os.Stderr
+		if err := applyCmd.Run(); err != nil {
+			return fmt.Errorf("git stash apply failed: %w", err)
 		}
 	}
 	return nil
@@ -137,6 +150,11 @@ func gitStash(label string) (string, error) {
 	if strings.Contains(output, "No local changes") {
 		return "", nil
 	}
-	// Extract stash reference from output like "Saved working directory and index state..."
+
+	// git stash push removes changes from working directory.
+	// Immediately re-apply so checkpoint doesn't modify user's files.
+	applyCmd := exec.Command("git", "stash", "apply", "stash@{0}")
+	_ = applyCmd.Run()
+
 	return "stash@{0}", nil
 }
