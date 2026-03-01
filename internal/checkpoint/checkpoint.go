@@ -46,10 +46,8 @@ func Save(sessionID, label string, scrollback []byte) (*Checkpoint, error) {
 
 	// Try git stash if we're in a git repo
 	if isGitRepo() {
-		stashID, err := gitStash(label)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "  Warning: git stash failed: %v\n", err)
-		} else if stashID != "" {
+		stashID, _ := gitStash(label)
+		if stashID != "" {
 			chk.GitStash = stashID
 		}
 	}
@@ -144,14 +142,11 @@ func gitStash(label string) (string, error) {
 	msg := fmt.Sprintf("pair-share: %s", label)
 	cmd := exec.Command("git", "stash", "push", "-u", "-m", msg)
 	out, err := cmd.CombinedOutput()
-
-	output := strings.TrimSpace(string(out))
-	fmt.Fprintf(os.Stderr, "  [debug] git stash output: %q, err: %v\n", output, err)
-
 	if err != nil {
-		return "", fmt.Errorf("git stash: %w (output: %s)", err, output)
+		return "", err
 	}
 
+	output := strings.TrimSpace(string(out))
 	if strings.Contains(output, "No local changes") || output == "" {
 		return "", nil
 	}
@@ -159,8 +154,7 @@ func gitStash(label string) (string, error) {
 	// git stash push removes changes from working directory.
 	// Immediately re-apply so checkpoint doesn't modify user's files.
 	applyCmd := exec.Command("git", "stash", "apply", "stash@{0}")
-	applyOut, applyErr := applyCmd.CombinedOutput()
-	fmt.Fprintf(os.Stderr, "  [debug] git stash apply: %q, err: %v\n", strings.TrimSpace(string(applyOut)), applyErr)
+	_ = applyCmd.Run()
 
 	return "stash@{0}", nil
 }
