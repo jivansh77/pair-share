@@ -232,7 +232,7 @@ func (s *Server) handleGuest(conn *websocket.Conn, sessionID string, r *http.Req
 
 	// Check token-based auth (agent) or password
 	token := r.URL.Query().Get("token")
-	isAgent := r.URL.Query().Get("role") == "agent"
+	isAgent := r.URL.Query().Get("agent") == "true"
 	agentToken := ""
 
 	if token != "" {

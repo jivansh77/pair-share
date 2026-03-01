@@ -170,12 +170,12 @@ func RunHost(opts HostOptions) error {
 func RunGuest(opts GuestOptions) error {
 	params := map[string]string{
 		"session":  opts.SessionID,
-		"role":     "guest",
+		"role":     "guest", // Always "guest" for WebSocket - agents are guests with tokens
 		"password": opts.Password,
 		"token":    opts.Token,
 	}
-	if opts.Role != "" {
-		params["role"] = opts.Role
+	if opts.Role == "agent" {
+		params["agent"] = "true" // Signal to server this is an agent connection
 	}
 	if opts.Watch {
 		params["watch"] = "true"
