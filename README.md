@@ -2,6 +2,8 @@
 
 Real-time terminal sharing for pair debugging and AI agent collaboration.
 
+**What it does:** One person runs a terminal session (host); others join as guests and see the same screen in real time. Guests can type commands or watch only. You can checkpoint state (terminal + git stash), rollback, replay sessions (including from exported logs), and grant AI agents time-limited access via tokens. All traffic goes through a relay server you run (`pair-share serve`) or self-host.
+
 ## Installation
 
 ```bash
